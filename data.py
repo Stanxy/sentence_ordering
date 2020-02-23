@@ -6,6 +6,7 @@ from traceback import print_exc
 from nltk.tokenize import sent_tokenize, word_tokenize
 import numpy as np
 import itertools
+import os
 from utils import warmup_linear, bundle_part_to_batch
 
 
@@ -72,7 +73,7 @@ def fetch_sentence_pairs(tokenizer, pairs, shuffled_index, passage, p_key):
         token_type_id = [0] * len(concat_sents)
         concat_sents = tokenized_sent2 + ['[SEP]']
         input_id = tokenizer.convert_tokens_to_ids(concat_sents)
-        if len(concat_Sents) > 512: # 
+        if len(concat_sents) > 512: # 
             concat_Sents = concat_Sents[:512] # 
             print('SEQ TOO LONG! passage : {} pairs : {} {}'.format(p_key, \
                 shuffled_index[sent_id1], shuffled_index[sent_id1]))
@@ -103,7 +104,7 @@ def pairs_generator(lenth):
     indices = list(range(lenth))
     combs_one_side = list(itertools.combinations(indices, 2))
     combs_other_side = [(x2, x1) for x1,x2 in combs_one_side]
-    combs = ombs_oneside + combs_other_side
+    combs = combs_one_side + combs_other_side
     return combs, len(combs)
 
 def convert_passage_to_sample_bundle(tokenizer, data: 'json refined', mode, kw, p_key):
@@ -147,7 +148,7 @@ def convert_passage_to_sample_bundle(tokenizer, data: 'json refined', mode, kw, 
     pairs_list, pairs_num = pairs_generator(passage_length) 
 
     input_ids, token_type_ids, masked_ids, sep_positions, max_sample_len = \
-        fetch_sentence_pairs(tokenizer, pairs, shuffled_index, passage, p_key)
+        fetch_sentence_pairs(tokenizer, pairs_list, shuffled_index, passage, p_key)
     
     _id = data[p_key]
     ret = Bundle()
@@ -198,7 +199,7 @@ def homebrew_data_loader(bundles, batch_size = 8):
     np.random.permutation(bundles)
 
     all_bundle = Bundle() # all_bundle is a bundle object
-    for field in FIELDS[:valid_field]: # for the first 7 fields
+    for field in TRAIN_TEST_FIELDS[:valid_field]: # for the first 7 fields
         t = [] # 
         setattr(all_bundle, field, t) # t is an empty list. This is to set a bundle where its first 7 fields are all empty lists. 
         # seems like a kind of initialization

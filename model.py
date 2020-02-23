@@ -7,6 +7,8 @@ from pytorch_pretrained_bert.modeling import (
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
+import itertools
 
 
 class MLP(nn.Module):
@@ -90,7 +92,7 @@ class FormAdjcent(nn.Module):
         
         return self.adjacent_matrix_list
 
-class BottomlLevelAttention(nn.Module):
+class BottomLevelAttention(nn.Module):
     """ Applies attention mechanism on the `context` using the `query`.
 
     **Thank you** to IBM for their initial implementation of :class:`Attention`. Here is
@@ -99,6 +101,11 @@ class BottomlLevelAttention(nn.Module):
 
     Params:
         config: a BertConfig class instance with the configuration to build a new model
+        `attention_type` (str, optional): How to compute the attention score:
+
+            * dot: :math:`score(H_j,q) = H_j^T q`
+            * general: :math:`score(H_j, q) = H_j^T W_a q`
+
 
     Inputs:
         `sequence_output` (torch.FloatTensor): a torch.FloatTensor of shape 
@@ -107,10 +114,7 @@ class BottomlLevelAttention(nn.Module):
         `pairs_list` : the list of pairs denotes the position of vector in each row.
         `passage_length` : the list of passage length used to do strength.
         `sep_positions` : the list of seperate positions of each sentence pair sequence
-        `attention_type` (str, optional): How to compute the attention score:
 
-            * dot: :math:`score(H_j,q) = H_j^T q`
-            * general: :math:`score(H_j, q) = H_j^T W_a q`
 
     Outputs:
         `integrated_pairs_of_sentence_list` : the list tensor pack for each passage. 
@@ -119,7 +123,7 @@ class BottomlLevelAttention(nn.Module):
     """
 
     def __init__(self, config, attention_type='general'):
-        super(BottomlLevelAttention, self).__init__()
+        super(BottomLevelAttention, self).__init__()
 
         if attention_type not in ['dot', 'general']:
             raise ValueError('Invalid attention type selected.')
@@ -161,8 +165,8 @@ class BottomlLevelAttention(nn.Module):
         self.selected_masks = self.selected_masks == 1
         selected_querys = torch.masked_select(sequence_output, self.selected_masks).reshape(-1,2,hidden_size) # [expanded_sample_num, 2, hidden_size]
 
-        expanded_sample_num, 2, hidden_size = selected_querys.size()
-        max_len = context.size(1)
+        expanded_sample_num, _, hidden_size = selected_querys.size()
+        # max_len = sequence_output.size(1)
 
         if self.attention_type == "general":
             query = query.reshape(expanded_sample_num * 2, hidden_size)
@@ -173,19 +177,19 @@ class BottomlLevelAttention(nn.Module):
 
         # (expanded_sample_num, 2, hidden_size) * (expanded_sample_num, max_len, hidden_size) ->
         # (expanded_sample_num, 2, max_len)
-        attention_scores = torch.bmm(query, context.transpose(1, 2).contiguous())
+        attention_scores = torch.bmm(query, sequence_output.transpose(1, 2).contiguous())
         attention_masks = attention_masks.to(dtype=torch.float)
         attention_masks = (1.0 - attention_masks) * -10000.0
         attention_scores += attention_masks
 
-        # Compute weights across every context sequence
+        # Compute weights across every sequence_output sequence
         attention_scores = attention_scores.view(expanded_sample_num * 2, max_len)
         attention_weights = self.softmax(attention_scores)
         attention_weights = attention_weights.view(expanded_sample_num, 2, max_len)
 
         # (expanded_sample_num, 2, max_len) * (expanded_sample_num, max_len, hidden_size) ->
         # (expanded_sample_num, 2, hidden_size)
-        mix = torch.bmm(attention_weights, context)
+        mix = torch.bmm(attention_weights, sequence_output)
 
         # concat -> (expanded_sample_num * 2, 2*hidden_size)
         # combined = torch.cat((mix, query), dim=2)
@@ -220,15 +224,16 @@ class UpperLevelAttention(nn.Module):
 
     Params:
         config: a BertConfig class instance with the configuration to build a new model
+        `attention_type` (str, optional): How to compute the attention score:
+
+            * sum: :math:`score(H_j,q) = 1`
+            * self_generate: :math:`score(H_j, q) = MLP(H_j^T)`
 
     Inputs:
         `tensor_packs` (torch.FloatTensor): the list tensor pack for each passage. 
         [ torch.tensor ] * sample_num. each element is the tensor with a shape 
         [sent_num, edg_num, hidden_size]
-        `attention_type` (str, optional): How to compute the attention score:
 
-            * sum: :math:`score(H_j,q) = 1`
-            * self_generate: :math:`score(H_j, q) = MLP(H_j^T)`
 
     Outputs:
         `node_list` : the list tensors of nodes for each passage. 
@@ -251,23 +256,21 @@ class UpperLevelAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.tanh = nn.Tanh()
 
-    def forward(self, tensor_packs)
+    def forward(self, tensor_packs):
         node_list = []
 
         for sample in tensor_packs:
             passage_num, edge_num, hidden_size = sample.size()
-            edge_num = sample.size(1)
+            # edge_num = sample.size(1)
 
             if self.attention_type == "general":
                 query = sample.view(passage_num * edge_num, hidden_size)
                 query = self.linear_in(query)
                 query = query.reshape(passage_num, edge_num)
             else:
-                query = torch.ones(passage_num, edge_num) [passage_num, edge_num]
+                query = torch.ones(passage_num, edge_num) #  [passage_num, edge_num]
 
             attention_scores = query.unsqueeze(dim=1) # [passage_num, 1, hidden_size]
-
-            # TODO: Include mask on PADDING_INDEX?
 
             # (passage_num, 1, hidden_size) * (passage_num, edge_num, hidden_size) ->
             # (passage_num, 1, edge_num)
@@ -280,7 +283,7 @@ class UpperLevelAttention(nn.Module):
 
             # (passage_num, 1, edge_num) * (passage_num, edge_num, hidden_size) ->
             # (passage_num, 1, hidden_size)
-            mix = torch.bmm(attention_weights, context)
+            mix = torch.bmm(attention_weights, sample)
 
             # concat -> (passage_num * 1, 2*hidden_size)
             # combined = torch.cat((mix, query), dim=2)
@@ -703,7 +706,7 @@ class BackwardFowardAttentiveDecoder(nn.Module):
         :param int config: a BertConfig class instance with the configuration to build a new model
         """
 
-        super(BackwardFowardAttentiveDeoder, self).__init__()
+        super(BackwardFowardAttentiveDecoder, self).__init__()
         self.decoder = Decoder(config)
 
         # Initialize decoder_input0
@@ -722,7 +725,7 @@ class BackwardFowardAttentiveDecoder(nn.Module):
         decoder_input0 = (inputs.sum(dim=1), inputs.sum(dim=1)) # this is the hidden vector we have
 
         answers = self.pad_answers(passage_length, answers)
-        musk_length = self.generate_mask(passage_length)
+        mask_length = self.generate_mask(passage_length)
 
         (outputs, pointers), decoder_hidden = self.decoder(inputs,
                                                            decoder_input0,
@@ -733,7 +736,7 @@ class BackwardFowardAttentiveDecoder(nn.Module):
 
     def pad_answers(self, passage_length, answers):
         max_len = max(passage_length)
-        answers_new = []
+        answers_padded = []
         for answer in answers:
             answer += [-1] * (max_len - len(answer))
             answers_padded.append(torch.tensor(answer).unsqueeze(dim=0))
@@ -777,11 +780,11 @@ def calculate_loss(batch, model1, model2, model3, device, critic):
     log_loss_masked = log_loss.masked_fill(mask = 1-mask, value = torch.tensor(0))
     
     pointers_masked = pointers_tensor.masked_fill(mask = 1-mask, value = torch.tensor(-1)).tolist()
-    pointers = [ one_pointer[:one_pointer.index(-1)] for one_pointer in pointers_mask]
+    pointers = [ one_pointer[:one_pointer.index(-1)] for one_pointer in pointers_masked]
     # now the pointers and gournd truth has the same data structure
     return log_loss_masked.sum() / logits.size(0), pointers, ground_truth
 
-def dev_test(batch, model1, model2, model3, device, critic):
+def dev_test(batch, model1, model2, model3, device):
     '''Function to gain Loss
 
     Inputs : 
@@ -790,11 +793,10 @@ def dev_test(batch, model1, model2, model3, device, critic):
         model 2 : the middle layer model
         model 3 : the last layer model
         device : the device that takes in the datacude or cpu.
-        critic : a torch.nn loss obj which used to calculate the loss
-        
 
     Outputs :
-        loss : the final loss of the training
+        best_pointers : the selected ordering list
+        ground_truth : the true ordering list
     '''
 
     input_ids, token_type_ids, masked_ids, pairs_list, sep_positions, ground_truth, passage_length, pairs_num = batch
@@ -906,20 +908,18 @@ def beam_search_pointer(model, encoded_nodes, passage_length, beam_size = 32):
     # mask = model.mask.repeat(input_length).unsqueeze(0).repeat(batch_size, 1) # all ones
     # model.att.init_inf(mask.size()) # all neg inf
     # mask = mask_length * mask # when the length is over the total num of sentences, we set the mask to zero
-
+    remain_list = [0]
     for t in range(target_t):
         candidates = prev_beam.candidates # candidates  = [ [idx11, idx12, ...], [idx21, idx22, ...] ] 
         if t == 0:
             # start
             # dec_input = encoded_nodes.new_zeros(1, 1, H) # tensor size [batch_size, 1, hidden_size]. Here the 1 is perhaps used foe broadcasting
             mask = encoded_nodes.new_zeros(1, T).byte() # (byte) tensor size [batch_size, max_lenth]. Here 1 is perhaps used for broadcasting
-            decoder_input = model.first_input.unsqueeze(dim=0).expand(embedded_inputs.size(0), -1)# .unsqueeze(dim=1) # [batch_size, hidden_size]
+            decoder_input = model.first_input.unsqueeze(dim=0).expand(encoded_nodes.size(0), -1)# .unsqueeze(dim=1) # [batch_size, hidden_size]
             backward_mask = torch.cat([torch.ones(mask.size(0), 1), mask[:,-1]], dim=1).byte() # move one unit left. 
             model.backward_attention.init_inf(backward_mask.size())
             past = decoder_input.unsqueeze(dim=1)
             hidden = (encoded_nodes.sum(dim=1), encoded_nodes.sum(dim=1))
-
-            beam_remain_ix = encoded_nodes[0].new_tensor(remain_list)
         else:
             # select the last list element in each element list of candidates.  
             index = encoded_nodes.new_tensor(list(map(lambda cand: cand[-1], candidates))).long() # [beam] long teensor
@@ -934,10 +934,12 @@ def beam_search_pointer(model, encoded_nodes, passage_length, beam_size = 32):
 
             past = torch.cat([past, decoder_input.unsqueeze(dim=1)], dim=1) # [beam_size, max_len]
 
-        h_t, c_t, outs = model.step(decoder_input, embedded_inputs, hidden, past, backward_mask, t) # outs - float tensor [beam_size, max_len]
+        h_t, c_t, outs = model.step(decoder_input, encoded_nodes, hidden, past, backward_mask, t) # outs - float tensor [beam_size, max_len]
         logp = torch.log(outs)
-        next_beam = Beam(valid_size) # generat another beam
+        next_beam = Beam(valid_size) # generat another beam 
         done_list, remain_list = next_beam.step(-logp, prev_beam, f_done) # 
+        if t == 0:
+            beam_remain_ix = encoded_nodes[0].new_tensor(remain_list)
         hyp_list.extend(done_list)
         valid_size -= len(done_list) # we have finished some of the sequence
 

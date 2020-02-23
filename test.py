@@ -2,7 +2,7 @@
 import json
 import os
 from tqdm import tqdm, trange
-from traceback import print_exc
+import traceback
 import numpy as np
 # waiting to be finished
 from data import convert_passage_to_samples_bundle, load_superbatch, homebrew_data_loader
@@ -53,16 +53,16 @@ def test(testing_data_file, super_batch_size, tokenizer, mode, kw, p_key, \
         ken_taus = []
         pmrs = []
 
-        for superbatch in load_superbatch(valid_data_file, super_batch_size):
+        for superbatch in load_superbatch(testing_data_file, super_batch_size):
 
             bundles = []
             
 
             for data in superbatch:
                 try:
-                    bundles.append(convert_passage_to_samples_bundle(tokenizer, data, mode = mode, kw, p_key))
+                    bundles.append(convert_passage_to_samples_bundle(tokenizer, data, mode, kw, p_key))
                 except:
-                    print_exc()
+                    traceback.print_exc()
 
             num_batch, valid_dataloader = homebrew_data_loader(bundles, batch_size=1)
             
@@ -71,27 +71,25 @@ def test(testing_data_file, super_batch_size, tokenizer, mode, kw, p_key, \
                 try:
                     batch = tuple(t.to(device) for idx,t in enumerate(batch) if idx < 3)
                     pointers_output, ground_truth \
-                        = dev_test(batch, model1, model2, model3, device, critic)
-                    valid_value.append(valid_critic_dict[valid_critic](pointers_output, ground_truth))
+                        = dev_test(batch, model1, model2, model3, device)
+                    # valid_value.append(valid_critic_dict[valid_critic](pointers_output, ground_truth))
 
                 except Exception as err:
-                traceback.print_exc()
-                if mode == 'bundle':   
-                    print(batch._id) 
+                    traceback.print_exc()
             
-                rouge-ws.append(rouge_w(pointers_output, ground_truth))
+                rouge_ws.append(rouge_w(pointers_output, ground_truth))
                 accs.append(acc(pointers_output, ground_truth))
                 ken_taus.append(kendall_tau(pointers_output, ground_truth))
                 pmrs.append(pmr(pointers_output, ground_truth))
 
-                result_list.append({ 'Kendall-tau' : ken_taus[-1], 'Accuracy' : accs[-1], 'ROUGE-w' : rouge-ws[-1], 
+                result_list.append({ 'Kendall-tau' : ken_taus[-1], 'Accuracy' : accs[-1], 'ROUGE-w' : rouge_ws[-1], 
                 'PMR' : pmrs[-1], 'true': ground_truth, 'pred' : pointers_output})
 
-            print('finishe {} samples. \n'.format(len(rouge-ws))
+            print('finishe {} samples. \n'.format(len(rouge_ws)))
 
         over_all['Kendall-tau'] = np.mean(ken_taus)
         over_all['Accuracy'] = np.mean(accs)
-        over_all['ROUGE-w'] = np.mean(rouge-ws)
+        over_all['ROUGE-w'] = np.mean(rouge_ws)
         over_all['PMR'] = np.mean(pmrs)
         
         print('Final scores:  kendall:{:.4f}, accuracy:{:.4f}, rouge-w:{:.4f}, pmr:{:.4f}\n'.format( \
@@ -119,7 +117,7 @@ def main(trained_model_file = './models/bert-base-cased.bin', test_data_file = '
 
     print('Start Training... on {} GPUs'.format(torch.cuda.device_count()))
     # model1 = torch.nn.DataParallel(model1, device_ids = range(torch.cuda.device_count()))
-    result_pack, over_all = test(testing_data_file, super_batch_size, tokenizer, mode, kw, p_key, \
+    result_pack, over_all = test(test_data_file, super_batch_size, tokenizer, mode, kw, p_key, \
         model1=model1, device=device, model2=model2, model3=model3) # stores the overall result into the over_all dictionary
 
     # we plan to output the attention prob in the future. Here we tend to simply 

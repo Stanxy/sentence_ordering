@@ -3,6 +3,7 @@ import numpy as np
 from bisect import bisect_left
 import torch
 import rouge
+import itertools
 
 aggregator = 'Best'
 apply_avg = aggregator == 'Avg'
@@ -29,7 +30,7 @@ def acc(pred, truth):
 def kendall_tau(pred, truth):
     s_t = set([i for i in itertools.combinations(truth, 2)])
     s_p = set([i for i in itertools.combinations(pred, 2)])
-    cn_2 = len(p) * (len(p) - 1) / 2
+    cn_2 = len(pred) * (len(pred) - 1) / 2
     pairs = len(s_p) - len(s_p.intersection(s_t))
     tau = 1 - 2 * pairs / cn_2
     return tau
@@ -68,7 +69,7 @@ def bundle_part_to_batch(all_bundle, l = None, r = None):
     passage_length = all_bundle.passage_length[l:r]
     pairs_num = all_bundle.pairs_num[l:r]
 
-    l_paris = sum([x for x in all_bundle.pairs_num[:l]])
+    l_pairs = sum([x for x in all_bundle.pairs_num[:l]])
     r_pairs = sum([x for x in all_bundle.pairs_num[:r]])
     pairs_list = all_bundle.pairs_list[l_pairs, r_pairs]
     for i in range(l_pairs,r_pairs):

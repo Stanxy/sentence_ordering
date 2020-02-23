@@ -8,13 +8,15 @@ import numpy as np
 from data import convert_passage_to_samples_bundle, load_superbatch, homebrew_data_loader
 from model import HierarchicalSentenceEncoder, GlobalGraphPropagation, BackwardFowardAttentiveDecoder
 from model import calculate_loss, dev_test
-from utils import warmup_linear, rouge_w, acc, kendall_tau, pmr
+from utils import WindowMean, acc, kendall_tau, pmr, rouge_w, warmup_linear
 
 from pytorch_pretrained_bert.tokenization import whitespace_tokenize, BasicTokenizer, BertTokenizer
 from pytorch_pretrained_bert.optimization import BertAdam
+from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 import torch
 from torch import nn
 from torch.optim import Adam, Adadelta
+import traceback
 
 def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode, kw, p_key, model1, device, model2, model3, \
             batch_size, num_epoch, gradient_accumulation_steps, lr1, lr2, lambda_, valid_critic, early_stop):
@@ -83,7 +85,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
             
             for data in superbatch:
                 try:
-                    bundles.append(convert_passage_to_samples_bundle(tokenizer, data, mode = mode, kw, p_key))
+                    bundles.append(convert_passage_to_samples_bundle(tokenizer, data, mode, kw, p_key))
                     
                 except:
                     print_exc()
@@ -140,6 +142,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                     #     print(batch._id) 
 
         if epoch < 5:
+            best_score = 0
             continue
 
         with torch.no_grad():
@@ -152,7 +155,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                 
                 for data in superbatch:
                     try:
-                        bundles.append(convert_passage_to_samples_bundle(tokenizer, data, mode = mode, kw, p_key))
+                        bundles.append(convert_passage_to_samples_bundle(tokenizer, data, mode, kw, p_key))
                     except:
                         print_exc()
 
@@ -163,7 +166,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                     try:
                         batch = tuple(t for idx,t in enumerate(batch) )
                         pointers_output, ground_truth \
-                            = dev_test(batch, model1, model2, model3, device, critic)
+                            = dev_test(batch, model1, model2, model3, device)
                         valid_value.append(valid_critic_dict[valid_critic](pointers_output, ground_truth))
 
                     except Exception as err:
@@ -172,7 +175,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                         #     print(batch._id) 
 
                 score = np.mean(valid_value)
-            print('epc:{}, {} : {:.2f} best : {:.2f}\n'.format(epc, valid_critic, score, best_score))
+            print('epc:{}, {} : {:.2f} best : {:.2f}\n'.format(epoch, valid_critic, score, best_score))
 
             if score > best_score:
                 best_score = score
@@ -192,13 +195,13 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
 
 
             if early_stop and (epoch - best_iter) >= early_stop:
-                print('early stop at epc {}'.format(epc))
+                print('early stop at epc {}'.format(epoch))
                 break
 
 def main(output_model_file = './models/bert-base-cased.bin', training_data_file = './data/TRAIN_DATA_NAME', \
         valid_data_file = './data/VALID_DATA_NAME', super_batch_size = 200, mode = 'list', kw = 'abstract', \
         batch_size = 4, num_epoch = 1, gradient_accumulation_steps = 1, lr1 = 1e-4, lr2 = 1e-4, \
-        lambda_ = 0.01, p_key = 'title', valid_critic = 'ken-tau', early_stop = 5):
+        lambda_ = 0.01, p_key = 'title', valid_critic = 'ken-tau', early_stop = 5, load=False):
     BERT_MODEL = 'bert-base-cased'
     tokenizer = BertTokenizer.from_pretrained(BERT_MODEL, do_lower_case=False)
     device = torch.device('cpu') if not torch.cuda.is_available() else torch.device('cuda')
