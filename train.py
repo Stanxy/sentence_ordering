@@ -59,7 +59,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
         {'params': [p for n, p in param_optimizer_others if not any(nd in n for nd in no_decay)], 'weight_decay': lambda_},
         {'params': [p for n, p in param_optimizer_others if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
-
+    # We shall adda  module to count the num of parameters here
     critic = nn.NLLLoss(reduction='none')
 
     line_num = int(os.popen("wc -l " + training_data_file).read().split()[0])
@@ -73,7 +73,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
     model2.train() # 
     model3.to(device) # 
     model3.train() # 
-
+    warmed = True
     for epoch in trange(num_epoch, desc = 'Epoch'):
         
         smooth_mean = WindowMean()
@@ -99,13 +99,18 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                     #batch[0] = batch[0].to(device)
                     #batch[1] = batch[1].to(device)
                     #batch[2] = batch[2].to(device)
-                    batch = tuple(t for t in enumerate(batch))
+                    batch = tuple(t for t in batch)
                     log_prob_loss, pointers_output, ground_truth = calculate_loss(batch, model1, model2, model3, device, critic)
                     # here we need to add code to cal rouge-w and acc
-                    rouge_ws = rouge_w(pointers_output, ground_truth)
-                    accs = acc(pointers_output, ground_truth)
-                    ken_taus = kendall_tau(pointers_output, ground_truth)
-                    pmrs = pmr(pointers_output, ground_truth)
+                    rouge_ws = []
+                    accs = []
+                    ken_taus = []
+                    pmrs = []
+                    for pred, true in zip(pointers_output, ground_truth):
+                        rouge_ws.append(rouge_w(pred, true))
+                        accs.append(acc(pred, true))
+                        ken_taus.append(kendall_tau(pred, true))
+                        pmrs.append(pmr(pred, true))
 
                     log_prob_loss.backward()
 
@@ -122,7 +127,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                         opt2.zero_grad()
                         smooth_mean_loss = smooth_mean.update(log_prob_loss.item())
                         tqdm_obj.set_description('{}: {:.4f}, {}: {:.4f}, smooth_mean_loss: {:.4f}'.format(
-                            'accuracy', accs, 'rough-w', rouge_ws,  smooth_mean_loss))
+                            'accuracy', np.mean(accs), 'rough-w', np.mean(rouge_ws),  smooth_mean_loss))
                         # During warming period, model1 is frozen and model2 is trained to normal weights
                         if smooth_mean_loss < 1.0 and step > 100: # ugly manual hyperparam
                             warmed = True
@@ -138,6 +143,7 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
 
                 except Exception as err:
                     traceback.print_exc()
+                    exit()
                     # if mode == 'list':   
                     #     print(batch._id) 
 
@@ -198,9 +204,9 @@ def train(training_data_file, valid_data_file, super_batch_size, tokenizer, mode
                 print('early stop at epc {}'.format(epoch))
                 break
 
-def main(output_model_file = './models/bert-base-cased.bin', training_data_file = './data/TRAIN_DATA_NAME', \
-        valid_data_file = './data/VALID_DATA_NAME', super_batch_size = 200, mode = 'list', kw = 'abstract', \
-        batch_size = 4, num_epoch = 1, gradient_accumulation_steps = 1, lr1 = 1e-4, lr2 = 1e-4, \
+def main(output_model_file = './models/bert-base-cased.bin', training_data_file = './sample/arxiv-abstract-train.json', \
+        valid_data_file = './sample/arxiv-abstract-dev.json', super_batch_size = 200, mode = 'list', kw = 'abstract', \
+        batch_size = 1, num_epoch = 1, gradient_accumulation_steps = 1, lr1 = 1e-4, lr2 = 1e-4, \
         lambda_ = 0.01, p_key = 'title', valid_critic = 'ken-tau', early_stop = 5, load=False):
     BERT_MODEL = 'bert-base-cased'
     tokenizer = BertTokenizer.from_pretrained(BERT_MODEL, do_lower_case=False)
@@ -209,28 +215,29 @@ def main(output_model_file = './models/bert-base-cased.bin', training_data_file 
         # Here if we have pretrained model we could use this
         print("Loading model from {}".format(output_model_file))
         model_state_dict = torch.load(output_model_file)
-        model1 = HierarchicalSentenceEncoder.from_pretrained(BERT_MODEL, state_dict=model_state_dict['params1'])
+        model1 = HierarchicalSentenceEncoder(BERT_MODEL, state_dict=model_state_dict['params1'])
         model2 = GlobalGraphPropagation(model1.config.hidden_size)
         model2.load_state_dict(model_state_dict['params2'])
-        model3 = BackwardFowardAttentiveDecoder(model1.config.hidden_size)
+        model3 = BackwardFowardAttentiveDecoder(model1.config)
         model2.load_state_dict(model_state_dict['params3'])
 
     else: # build new model
         # build sentence_encoder
-        model1 = HierarchicalSentenceEncoder.from_pretrained(BERT_MODEL,
+        model1 = HierarchicalSentenceEncoder(BERT_MODEL,
             cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(-1))
         print ("Finish building model1")
         model2 = GlobalGraphPropagation(model1.config.hidden_size)
         print ("FInish building model2")
-        model3 = BackwardFowardAttentiveDecoder(model1.config.hidden_size)
-        print ("FInish building model2")
+        model3 = BackwardFowardAttentiveDecoder(model1.config)
+        print ("FInish building model3")
     
     print('Start Training... on {} GPUs'.format(torch.cuda.device_count()))
     model1 = torch.nn.DataParallel(model1, device_ids = range(torch.cuda.device_count()))
-    train(training_data_file, super_batch_size, tokenizer, mode, kw, p_key, \
-        model1=model1, device=device, model2=model2, model3=model3, # Then pass hyperparams
+    train(training_data_file, valid_data_file=valid_data_file, super_batch_size=super_batch_size, \
+        tokenizer=tokenizer, mode=mode, \
+        kw=kw, p_key=p_key, model1=model1, device=device, model2=model2, model3=model3, # Then pass hyperparams
         batch_size=batch_size, num_epoch=num_epoch, gradient_accumulation_steps=gradient_accumulation_steps, \
-            lr11=lr1, lr2=lr2, lambda_=lambda_, valid_critic = valid_critic, early_stop = early_stop) 
+            lr1=lr1, lr2=lr2, lambda_=lambda_, valid_critic = valid_critic, early_stop = early_stop) 
 
 #import fire
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 from pytorch_pretrained_bert.modeling import (
-    PreTrainedBertModel, # The name was changed in the new versions of pytorch_pretrained_bert
+    BertPreTrainedModel as PreTrainedBertModel, # The name was changed in the new versions of pytorch_pretrained_bert
     gelu,
     BertEmbeddings,
     BertEncoder,
 )
+from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -49,12 +50,13 @@ class DGCN(nn.Module): # Directed Graph Convolution Network
         D_out = torch.diag(A.sum(axis = 1))
         P = torch.inverse(D_out).mm(A)
         phi = D_out
-        L_sym = torch.eye(A.shape[0]) - 1/2 * (torch.pow(phi, 1/2).mm(P.mm(torch.pow(phi, -1/2))) \
+        I = torch.eye(A.shape[0]).to(torch.device('cuda'))
+        L_sym = I - 1/2 * (torch.pow(phi, 1/2).mm(P.mm(torch.pow(phi, -1/2))) \
          + torch.pow(phi, -1/2).mm(P.t().mm(torch.pow(phi, 1/2))))
         layer1_diffusion = L_sym.mm(gelu(self.diffusion(x))) # activation?
         x = gelu(self.retained(x) + layer1_diffusion)
         layer2_diffusion = L_sym.mm(gelu(self.diffusion(x)))
-        self.predict = gelu(torch.cat(x , layer2_diffusion), 1)
+        self.predict = gelu(x + layer2_diffusion)
         return self.predict
 
 class FormAdjcent(nn.Module):
@@ -70,25 +72,26 @@ class FormAdjcent(nn.Module):
         `adjacent_matrix_list` : a list of torch.FloatTensor of shape n*n
     '''
     def __init__(self, config):
-        super(FormAdjcent, self).init()
+        super(FormAdjcent, self).__init__()
         self.weight_estimator = nn.Linear(config.hidden_size, 1)
 
-    def forward(self, pooled_output, pairs_list, passage_length, epsilon=1e-4):
+    def forward(self, pooled_output, pairs_list, passage_length, pairs_num, epsilon=1e-4):
         weight = self.weight_estimator(pooled_output)
         normed_weight = torch.sigmoid(weight).squeeze()
         self.position_pointer = 0
         self.adjacent_matrix_list = []
-
-        for length in passage_length:
-            passage_pairs_i = pairs_list[self.position_pointer: self.position_pointer + length] # slice the pairs_list
-            adjacent_matrix = torch.ones(length, length) # initialize the adjacent_matrix
+        #print ("pairs_num : ", pairs_num)
+        #print ("pairs_list : ", passage_length)
+        for comb_num, length in zip(pairs_num, passage_length):
+            passage_pairs_i = pairs_list[self.position_pointer : self.position_pointer + comb_num] # slice the pairs_list
+            adjacent_matrix = torch.ones([length, length]).to(torch.device('cuda')) # initialize the adjacent_matrix
 
             for idx, pair in enumerate(passage_pairs_i):
                 adjacent_matrix[pair[0], pair[1]] = normed_weight[self.position_pointer + idx]
             adjacent_matrix += epsilon # we want the graph to be strongly connected
             self.adjacent_matrix_list.append(adjacent_matrix)
 
-            self.position_pointer += length # Find the nexe front end
+            self.position_pointer += comb_num # Find the nexe front end
         
         return self.adjacent_matrix_list
 
@@ -143,33 +146,38 @@ class BottomLevelAttention(nn.Module):
         self.selected_masks = []
         self.attention_mask = []
 
+        print ("Tn total, we have {} sep pairs.".format(len(sep_positions)))
+        print ("The max length is {}".format(max_len))
+        # print ("The num")
+
         for sep in sep_positions:
     
             sent1_musk = [0] + [1] * (sep[0] - 1) + [0] * (max_len - sep[0])
-            sent1_musk = torch.tensor(sent1_musk).unsqueeze(dim=0).unsqueeze(dim=0)
+            sent1_musk = torch.tensor(sent1_musk).unsqueeze(dim=0)
             sent2_musk = [0] * (sep[0] + 1) + [1] * (sep[1] - sep[0] - 1) + [0] * (max_len - sep[1])
-            sent2_musk = torch.tensor(sent2_musk).unsqueeze(dim=0).unsqueeze(dim=0)
-            attention_mask = torch.cat([sent1_musk, sent2_musk], dim=1)
-            self.attention_mask.append(attention_mask)
+            sent2_musk = torch.tensor(sent2_musk).unsqueeze(dim=0)
+            attention_mask = torch.cat([sent1_musk, sent2_musk], dim=0)
+            self.attention_mask.append(attention_mask.unsqueeze(dim=0))
 
             selected_masks_i = torch.zeros(max_len)
             selected_masks_i[sep[0]] = 1
             selected_masks_i[sep[1]] = 1
-            selected_masks_i.unsqueeze(dim=0)
+            selected_masks_i = selected_masks_i.unsqueeze(dim=0)
             self.selected_masks.append(selected_masks_i)
 
-        attention_masks = torch.cat(self.attention_mask, dim=0) # ((expanded_sample_num, 2, max_len)
+        attention_masks = torch.cat(self.attention_mask, dim=0).to(torch.device('cuda')) # (expanded_sample_num, 2, max_len)
 
         self.selected_masks = torch.cat(self.selected_masks, dim=0)
-        self.selected_masks = self.selected_masks.unsqueeze(dim=0)
+        self.selected_masks = self.selected_masks.unsqueeze(dim=2)
         self.selected_masks = self.selected_masks == 1
+        self.selected_masks = self.selected_masks.to(torch.device('cuda'))
         selected_querys = torch.masked_select(sequence_output, self.selected_masks).reshape(-1,2,hidden_size) # [expanded_sample_num, 2, hidden_size]
 
         expanded_sample_num, _, hidden_size = selected_querys.size()
         # max_len = sequence_output.size(1)
 
         if self.attention_type == "general":
-            query = query.reshape(expanded_sample_num * 2, hidden_size)
+            query = selected_querys.reshape(expanded_sample_num * 2, hidden_size)
             query = self.linear_in(query)
             query = query.reshape(expanded_sample_num, 2, hidden_size)
 
@@ -180,6 +188,8 @@ class BottomLevelAttention(nn.Module):
         attention_scores = torch.bmm(query, sequence_output.transpose(1, 2).contiguous())
         attention_masks = attention_masks.to(dtype=torch.float)
         attention_masks = (1.0 - attention_masks) * -10000.0
+        print ("dim of attention_scores ", attention_scores.size())
+        print ("dim of attention_masks ", attention_masks.size())
         attention_scores += attention_masks
 
         # Compute weights across every sequence_output sequence
@@ -209,8 +219,8 @@ class BottomLevelAttention(nn.Module):
                 sentence_tensor_i[pair[1]].append(mix[self.position_pointer + idx_j][1].unsqueeze(0)) # 
             
             sentence_tensor_i = [torch.cat(tensor_stack, dim = 0).unsqueeze(0) for tensor_stack in sentence_tensor_i]
-            torch.cat(sentence_tensor_i, dim = 0)
-            self.integrated_pairs_of_sentence_list.append(sentence_tensor_i)
+            
+            self.integrated_pairs_of_sentence_list.append(torch.cat(sentence_tensor_i, dim = 0))
             self.position_pointer += pairs_num[idx_i]
 
         return self.integrated_pairs_of_sentence_list
@@ -264,11 +274,11 @@ class UpperLevelAttention(nn.Module):
             # edge_num = sample.size(1)
 
             if self.attention_type == "general":
-                query = sample.view(passage_num * edge_num, hidden_size)
+                query = sample.view(passage_num * edge_num, hidden_size).to(torch.device('cuda'))
                 query = self.linear_in(query)
                 query = query.reshape(passage_num, edge_num)
             else:
-                query = torch.ones(passage_num, edge_num) #  [passage_num, edge_num]
+                query = torch.ones(passage_num, edge_num).to(torch.device('cuda')) #  [passage_num, edge_num]
 
             attention_scores = query.unsqueeze(dim=1) # [passage_num, 1, hidden_size]
 
@@ -283,7 +293,8 @@ class UpperLevelAttention(nn.Module):
 
             # (passage_num, 1, edge_num) * (passage_num, edge_num, hidden_size) ->
             # (passage_num, 1, hidden_size)
-            mix = torch.bmm(attention_weights, sample)
+            # (passage_num, hidden_size
+            mix = torch.bmm(attention_weights, sample).squeeze()
 
             # concat -> (passage_num * 1, 2*hidden_size)
             # combined = torch.cat((mix, query), dim=2)
@@ -344,7 +355,7 @@ class LocalDependencyEncoder(PreTrainedBertModel):
         super(LocalDependencyEncoder, self).__init__(config)
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
-        self.pooler = MLP([config.hidden_size] * 3 + [1])
+        self.pooler = MLP([config.hidden_size] * 3)
         self.apply(self.init_bert_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=False):
@@ -365,7 +376,7 @@ class LocalDependencyEncoder(PreTrainedBertModel):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.nn.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embeddings(input_ids, token_type_ids)
@@ -375,12 +386,14 @@ class LocalDependencyEncoder(PreTrainedBertModel):
         sequence_output = encoded_layers[-1]
 
         first_token_tensor = sequence_output[:, 0]
-        pooled_output = self.pooler(sequence_output)
+        pooled_output = self.pooler(first_token_tensor)
 
         if not output_all_encoded_layers:
             encoded_layers = encoded_layers[-1]
-
-        return encoded_layers, pooled_output
+        #print ("The num of input_id is: ", input_ids.size(0))
+        #print ("The num of pooled_output is", pooled_output.size(0))
+        #exit()
+        return sequence_output, pooled_output
 
 class HierarchicalSentenceEncoder(nn.Module):
     '''module used to form sequence representations by a hierarchical approach
@@ -398,16 +411,22 @@ class HierarchicalSentenceEncoder(nn.Module):
         `nodes` : list of node tensors. tensor shape [passage_num, hidden_size]
         `graphs` : list of adjacent graph tensors. tensor shape [passage_num, passage_num]
     '''
-    def __init__(self, config):
-        super(HierarchicalSentenceEncoder, self).init()
-        self.bert_enc = LocalDependencyEncoder(config)
-        self.graph_generator = FormAdjcent(config)
-        self.bottom_level_encoder = BottomLevelAttention(config)
-        self.upper_level_encoder = UpperLevelAttention(config)
+
+    def __init__(self, bert_model, cache_dir=None, state_dict=None):
+        super(HierarchicalSentenceEncoder, self).__init__()
+        if cache_dir!=None:
+            self.bert_enc = LocalDependencyEncoder.from_pretrained(bert_model, cache_dir = cache_dir)
+        else:
+            self.bert_enc = LocalDependencyEncoder.from_pretrained(bert_model, state_dict=state_dict)
+        self.config = self.bert_enc.config
+        self.graph_generator = FormAdjcent(self.config)
+        self.bottom_level_encoder = BottomLevelAttention(self.config)
+        self.upper_level_encoder = UpperLevelAttention(self.config)
+        
 
     def forward(self, input_ids, token_type_ids, masked_ids, pairs_list, passage_length, pairs_num, sep_positions):
         encoded_layers, pooled_output = self.bert_enc(input_ids, token_type_ids, masked_ids)
-        graphs = self.graph_generator(pooled_output, pairs_list, passage_length)
+        graphs = self.graph_generator(pooled_output, pairs_list, passage_length, pairs_num)
         encoded_sentences = self.bottom_level_encoder(encoded_layers, pairs_list, passage_length, pairs_num, sep_positions)
         nodes = self.upper_level_encoder(encoded_sentences)
         return nodes, graphs
@@ -423,9 +442,9 @@ class GlobalGraphPropagation(nn.Module):
         `passage_represent` : tensor of the final representtion of the passage batch, padded
     '''
 
-    def __init__(self, config):
-        super(GlobalGraphPropagation, self).__init__
-        self.GNN = DGCN(config.hidden_size)
+    def __init__(self, hidden_size):
+        super(GlobalGraphPropagation, self).__init__()
+        self.GNN = DGCN(hidden_size)
         self.hidden_size = hidden_size
     def forward(self, nodes, graphs, passage_length):
         node_sets = [self.GNN(graph, node) for graph, node in zip(graphs, nodes)]
@@ -434,7 +453,7 @@ class GlobalGraphPropagation(nn.Module):
         new_batch = []
         for node_set in node_sets:
             sent_num, _ = node_set.size()
-            pad_tensor = torch.zeros(max - sent_num, self.hidden_size)
+            pad_tensor = torch.zeros(max_passage_num - sent_num, self.hidden_size).to(torch.device('cuda'))
             node_set = torch.cat([node_set, pad_tensor], dim=0).unsqueeze(0)
             new_batch.append(node_set)
         return torch.cat(new_batch, dim=0)
@@ -442,14 +461,14 @@ class GlobalGraphPropagation(nn.Module):
 class BertSelfAttention(nn.Module):
     def __init__(self, config):
         super(BertSelfAttention, self).__init__()
-        if config.hidden_size % 1 != 0: # we only want 1 head attention
+        if config.hidden_size % config.num_attention_heads != 0: # we only want config.num_attention_heads head attention
             raise ValueError(
                 "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (config.hidden_size, 1))
-
+                "heads (%d)" % (config.hidden_size, config.num_attention_heads))
+        
         self._inf = nn.Parameter(torch.FloatTensor([float('-inf')]), requires_grad=False)
-        self.num_attention_heads = 1
-        self.attention_head_size = int(config.hidden_size / 1) 
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads) 
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
@@ -466,25 +485,27 @@ class BertSelfAttention(nn.Module):
 
     def forward(self, hidden_states, attention_mask, cell_state, t):
         mixed_query_layer = self.query(cell_state.unsqueeze(1)) # Find the newest node 
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+        mixed_key_layer = self.key(hidden_states[:,:-1])
+        mixed_value_layer = self.value(hidden_states[:,:-1])
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        # [batch_size, 1, hidden_size] * [batch_size, hidden_size, max_length]
-        # [batch_size, 1, max_length]
+        # [batch_size, head, hidden_size] * [batch_size, hidden_size, max_length]
+        # [batch_size, head, max_length]
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) 
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size) # [batch_size, 1, max_len]
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size) # [batch_size, num_head, max_len]
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-        attention_scores = attention_scores.squeeze()
-        mask = torch.eq(attention_mask, 0)
-        if len(attention_scores[mask]) > 0: # mask the unneeded ones
-            att[mask] = self.inf[mask]
-        attention_scores = attention_scores.unsqueeze(1)
-        # attention_scores = attention_scores +  # [batch_size, 1, max_length]
+        # attention_scores = attention_scores.squeeze()
+        # [batch_size, max_length]
+        mask = (self.inf[:,:t] * torch.eq(attention_mask, 0).float()).unsqueeze(dim=1).unsqueeze(dim=2).expand(-1, \
+            self.num_attention_heads, 1, -1)
+        print ("num of head", self.num_attention_heads)
+        print ("Size of mask", mask.size())
+        print ("Size of attention", attention_scores.size())
+        attention_scores = attention_scores + mask # [batch_size, num_head, max_length]
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -531,7 +552,7 @@ class Attention(nn.Module):
         self.softmax = nn.Softmax()
 
         # Initialize vector V
-        nn.init.uniform(self.V, -1, 1)
+        nn.init.uniform_(self.V, -1, 1)
 
     def forward(self, input_,
                 context,
@@ -588,10 +609,10 @@ class Decoder(nn.Module):
         self.first_input = nn.Parameter(torch.FloatTensor(self.hidden_dim), requires_grad=True) # the trainable first input
         self.backward_attention = BertSelfAttention(config)
         
-        nn.init.uniform(self.first_input, -1, 1)
+        nn.init.uniform_(self.first_input, -1, 1)
         # Used for propagating .cuda() command
-        self.mask = nn.Parameter(torch.ones(1), requires_grad=False)
-        self.runner = nn.Parameter(torch.zeros(1), requires_grad=False)
+        self.mask = nn.Parameter(torch.ones(1).byte(), requires_grad=False)
+        self.runner = nn.Parameter(torch.zeros(1).byte(), requires_grad=False)
 
     def step(self, x, embedded_inputs, hidden, context, mask, t):
         """
@@ -606,11 +627,13 @@ class Decoder(nn.Module):
         # Regular LSTM
         h, c = hidden
 
-        mask_step = mask * torch.cat([torch.ones(mask.size(0), (t+1)), \
-            torch.zeros(mask.size(0), mask.size(1)-(t+1))], dim=1)
+        mask_step = mask[:,:t]
 
-        b = self.backward_attention(self, context, mask_step, c) # [batch_size, hidden_size]
+        if t > 0:
+            b = self.backward_attention(context, mask_step, c, t) # [batch_size, hidden_size]
 
+        print ("The size of hidden is : ", h.size())
+        print ("The size of input is : ", x.size())
         gates = self.input_to_hidden(x) + self.hidden_to_hidden(h)
         input_, forget, cell, out = gates.chunk(4, 1)
 
@@ -620,7 +643,11 @@ class Decoder(nn.Module):
         out = F.sigmoid(out)
 
         c_t = (forget * c) + (input_ * cell)
-        backward_context_t = out * x + (1 - out) * b
+
+        if t > 0:
+            backward_context_t = out * x + (1 - out) * b
+        else:
+            backward_context_t = x
         #backward_hidden_t = self.hidden_out_backward(backward_context_t)
 
         # Attention section
@@ -653,10 +680,11 @@ class Decoder(nn.Module):
         runner = self.runner.repeat(input_length)
         for i in range(input_length):
             runner.data[i] = i
-        runner = runner.unsqueeze(0).expand(batch_size, -1).long()
+        runner = runner.unsqueeze(0).expand(batch_size, -1).byte() # [barch_size, max_len]
 
         decoder_input = self.first_input.unsqueeze(dim=0).expand(embedded_inputs.size(0), -1) # [batch_size, hidden_size]
-        backward_mask = torch.cat([torch.ones(mask.size(0), 1), mask[:,-1]], dim=1).byte() # move one unit left. 
+        backward_mask = torch.cat([torch.ones(mask.size(0), 1).byte().to(torch.device('cuda')) \
+            , mask[:,:-1]], dim=1) # move one unit left. 
         self.backward_attention.init_inf(backward_mask.size())
         past = decoder_input.unsqueeze(dim=1)
 
@@ -669,22 +697,25 @@ class Decoder(nn.Module):
             hidden = (h_t, c_t)
 
             # Masking selected inputs
-            masked_outs = outs * mask
+            masked_outs = outs * mask.float()
 
             # Get maximum probabilities and indices
             if answers is None:
                 max_probs, indices = masked_outs.max(1)
             else:
                 indices = answers[:,t] # batch_size, max_len, max_len 
-            one_hot_pointers = (runner == indices.unsqueeze(1).expand(-1, outs.size()[1])).float()
-
+            one_hot_pointers = (runner == indices.unsqueeze(1).expand(-1, outs.size()[1]).byte()) #[batch_size, max_len]
+            #print("the indices are : ", indices)
             # Update mask to ignore seen indices
-            mask  = mask * (1 - one_hot_pointers)
-            
+            mask  = (mask.float() * (1 - one_hot_pointers.float())).byte()
+            #print("mask values are : ", mask)
             # Get embedded inputs by max indices
-            embedding_mask = one_hot_pointers.unsqueeze(2).expand(-1, -1, self.embedding_dim).byte()
-            decoder_input = embedded_inputs[embedding_mask.data].view(batch_size, self.embedding_dim)
-
+            embedding_mask = one_hot_pointers.unsqueeze(2).expand(-1, -1, self.embedding_dim).byte()#[batch_size, max_len, hidden_size]
+            print("Our masks are : ", embedding_mask)
+            print("Our embedded inputs are : ", embedded_inputs)
+            decoder_input = embedded_inputs[embedding_mask.data].view(batch_size, self.embedding_dim) # []
+            #if t == input_length -1:
+            #    exit()
             past = torch.cat([past, decoder_input.unsqueeze(dim=1)], dim=1)
 
             outputs.append(outs.unsqueeze(0))
@@ -710,7 +741,7 @@ class BackwardFowardAttentiveDecoder(nn.Module):
         self.decoder = Decoder(config)
 
         # Initialize decoder_input0
-        nn.init.uniform(self.decoder_input0, -1, 1)
+        # nn.init.uniform_(self.decoder_input0, -1, 1)
 
     def forward(self, inputs, passage_length, answers=None):
         """
@@ -723,10 +754,10 @@ class BackwardFowardAttentiveDecoder(nn.Module):
         input_length = inputs.size(1)
 
         decoder_input0 = (inputs.sum(dim=1), inputs.sum(dim=1)) # this is the hidden vector we have
-
-        answers = self.pad_answers(passage_length, answers)
+        if answers != None:
+            answers = self.pad_answers(passage_length, answers)
         mask_length = self.generate_mask(passage_length)
-
+        print (inputs)
         (outputs, pointers), decoder_hidden = self.decoder(inputs,
                                                            decoder_input0,
                                                            mask_length, 
@@ -738,19 +769,18 @@ class BackwardFowardAttentiveDecoder(nn.Module):
         max_len = max(passage_length)
         answers_padded = []
         for answer in answers:
-            answer += [-1] * (max_len - len(answer))
-            answers_padded.append(torch.tensor(answer).unsqueeze(dim=0))
-        return torch.tensor(answers_padded, dim=1) # [batch_size, max_len]
+            answer += [max_len - 1] * (max_len - len(answer))
+            answers_padded.append(torch.LongTensor(answer).unsqueeze(dim=0))
+        return torch.cat(answers_padded, dim=0).to(torch.device('cuda')) # [batch_size, max_len]
 
     def generate_mask(self, passage_length):
         max_len = max(passage_length)
         mask = []
         for length in passage_length:
             mask_i = [1] * length + [0] * (max_len - length)
-            mask_tensor_i = torch.tensor(mask_i).unsqueeze(0)
+            mask_tensor_i = torch.ByteTensor(mask_i).unsqueeze(0)
             mask.append(mask_tensor_i)
-
-        return torch.cat(mask, dim=1) # [batch_size, max_len]
+        return torch.cat(mask, dim=0).to(torch.device('cuda')) # [batch_size, max_len]
 
 def calculate_loss(batch, model1, model2, model3, device, critic):
     '''Function to gain Loss
@@ -767,8 +797,13 @@ def calculate_loss(batch, model1, model2, model3, device, critic):
     Outputs :
         loss : the final loss of the training
     '''
-
+    
     input_ids, token_type_ids, masked_ids, pairs_list, sep_positions, ground_truth, passage_length, pairs_num = batch
+    #try:
+    #    assert masked_ids == torch.int64
+    #except:
+    #    print (masked_ids)
+    #    exit()
     nodes, graphs = model1(input_ids, token_type_ids, masked_ids, pairs_list, passage_length, pairs_num, sep_positions)
     encoded_nodes = model2(nodes, graphs, passage_length)
     logits_output, pointers_tensor = model3(encoded_nodes, passage_length, ground_truth)
@@ -780,7 +815,7 @@ def calculate_loss(batch, model1, model2, model3, device, critic):
     log_loss_masked = log_loss.masked_fill(mask = 1-mask, value = torch.tensor(0))
     
     pointers_masked = pointers_tensor.masked_fill(mask = 1-mask, value = torch.tensor(-1)).tolist()
-    pointers = [ one_pointer[:one_pointer.index(-1)] for one_pointer in pointers_masked]
+    pointers = [ one_pointer[:passage_length[idx]] for idx, one_pointer in enumerate(pointers_masked)]
     # now the pointers and gournd truth has the same data structure
     return log_loss_masked.sum() / logits.size(0), pointers, ground_truth
 

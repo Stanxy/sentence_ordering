@@ -62,7 +62,7 @@ def fetch_sentence_pairs(tokenizer, pairs, shuffled_index, passage, p_key):
     max_sample_len = 0 # save the max length of ids inorder to do padding
 
     for sent_id1, sent_id2 in pairs:
-        sep_position = (0,0)
+        sep_position = [0,0]
 
         sent1 = passage[shuffled_index[sent_id1]]
         sent2 = passage[shuffled_index[sent_id2]]
@@ -71,15 +71,15 @@ def fetch_sentence_pairs(tokenizer, pairs, shuffled_index, passage, p_key):
         concat_sents = ['[CLS]'] + tokenized_sent1 + ['[SEP]'] 
         sep_position[0] = len(concat_sents) - 1
         token_type_id = [0] * len(concat_sents)
-        concat_sents = tokenized_sent2 + ['[SEP]']
+        concat_sents += tokenized_sent2 + ['[SEP]']
         input_id = tokenizer.convert_tokens_to_ids(concat_sents)
         if len(concat_sents) > 512: # 
-            concat_Sents = concat_Sents[:512] # 
+            concat_sents = concat_sents[:512] # 
             print('SEQ TOO LONG! passage : {} pairs : {} {}'.format(p_key, \
-                shuffled_index[sent_id1], shuffled_index[sent_id1]))
+                shuffled_index[sent_id1], shuffled_index[sent_id2]))
 
         sep_position[1] = len(concat_sents) - 1
-        token_type_id = [1] * len(tokenized_sent2 + ['[SEP]'])
+        token_type_id += [1] * len(tokenized_sent2 + ['[SEP]'])
         masked_id = [1] * len(token_type_id)
 
         max_sample_len = len(masked_id) if max_sample_len < len(masked_id) else max_sample_len
@@ -87,7 +87,7 @@ def fetch_sentence_pairs(tokenizer, pairs, shuffled_index, passage, p_key):
         input_ids.append(input_id)
         masked_ids.append(masked_id)
         token_type_ids.append(token_type_id)
-        sep_positions.append(sep_position)
+        sep_positions.append(tuple(sep_position))
     
     return input_ids, token_type_ids, masked_ids, sep_positions, max_sample_len
 
@@ -107,7 +107,7 @@ def pairs_generator(lenth):
     combs = combs_one_side + combs_other_side
     return combs, len(combs)
 
-def convert_passage_to_sample_bundle(tokenizer, data: 'json refined', mode, kw, p_key):
+def convert_passage_to_samples_bundle(tokenizer, data: 'json refined', mode, kw, p_key):
     '''Make training samples.
         
         Convert document-format dict samples(various fields plus a list or long sting as the passage) to bundles.
@@ -126,14 +126,17 @@ def convert_passage_to_sample_bundle(tokenizer, data: 'json refined', mode, kw, 
         Returns:
             Bundle: A bundle containing the fields for each sample (including gold and shaffled sample).
     '''
-    if mode == 'list': # Then we need to clean data
+    if mode == 'string': # Then we need to clean data
         try:
             passage = data[kw].replace('\n',' ') # clean the '\n' char
+            
             passage = ' '.join(word_tokenize(passage)) # clean the long spaces
             passage = sent_tokenize(passage)
         except:
-            print ("Error when processing passage {}.\n".format(passage['id_'])) # print out which specific passage is dead
             print_exc()
+            exit()
+            print ("Error when processing passage {}.\n".format(passage['id'])) # print out which specific passage is dead
+            
     else:
         passage = data[kw]
 
@@ -165,9 +168,10 @@ def load_superbatch(data_file, super_batch_size): # we load the file by its supe
 
             if count_line % super_batch_size == 0 or count_line == line_num: # dump when a super is done
                 lines += line.strip() # push the last line into the lines stack
-                if lines.endswith(',\n'):
-                    lines = lines[:-2]
+                if lines.strip().endswith(','):
+                    lines = lines.strip()[:-1]
                 lines = '''[''' + lines + ''']''' # add 
+                # print (lines[:5], '\n', lines[:-5])
                 super_json_obj = json.loads(lines)
                 yield super_json_obj, line_num # yield a list
                 lines = "" # reinitialize lines
@@ -186,11 +190,11 @@ def homebrew_data_loader(bundles, batch_size = 8):
         (int, Generator): number of batches and a generator to generate batches.
     '''
 
-    bundles
+    # bundles
     if hasattr(bundles[0], 'ground_truth'): # check if we are training or predict
-        valid_field = 8
+        valid_field = 10
     else:
-        valid_field = 7
+        valid_field = 9
 
     # here we only shuffle passage
     n = len(bundles)
@@ -199,13 +203,16 @@ def homebrew_data_loader(bundles, batch_size = 8):
     np.random.permutation(bundles)
 
     all_bundle = Bundle() # all_bundle is a bundle object
-    for field in TRAIN_TEST_FIELDS[:valid_field]: # for the first 7 fields
+    for field in TRAIN_TEST_FIELDS[:valid_field]: # for the first few fields
         t = [] # 
-        setattr(all_bundle, field, t) # t is an empty list. This is to set a bundle where its first 7 fields are all empty lists. 
+        setattr(all_bundle, field, t) # t is an empty list. This is to set a bundle where its first few fields are all empty lists. 
         # seems like a kind of initialization
         for bundle in bundles: # iterate all bundle in bundles
-            t.extend(getattr(bundle, field)) # 
-        # In this step the fields in bundles are fill into an empty list 
+            if field not in set(['passage_length', 'pairs_num', 'max_sample_len','ground_truth','shuffled_index']):
+                t.extend(getattr(bundle, field)) # 
+            else:
+                t.append(getattr(bundle, field))
+        # In this step the fields in ,bundles are fill into an empty list 
     
     num_batch = (n - 1) // batch_size + 1
     def gen():

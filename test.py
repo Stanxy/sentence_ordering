@@ -69,7 +69,7 @@ def test(testing_data_file, super_batch_size, tokenizer, mode, kw, p_key, \
             valid_value = []
             for step, batch in enumerate(valid_dataloader):
                 try:
-                    batch = tuple(t.to(device) for idx,t in enumerate(batch) if idx < 3)
+                    batch = tuple(t for idx,t in enumerate(batch))
                     pointers_output, ground_truth \
                         = dev_test(batch, model1, model2, model3, device)
                     # valid_value.append(valid_critic_dict[valid_critic](pointers_output, ground_truth))

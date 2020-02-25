@@ -64,16 +64,19 @@ def bundle_part_to_batch(all_bundle, l = None, r = None):
     input_ids = torch.zeros((batch_length, max_length), dtype = torch.long)
     token_type_ids = torch.zeros((batch_length, max_length), dtype = torch.long)
     masked_ids = torch.zeros((batch_length, max_length), dtype = torch.long)
-    sep_positions = all_bundle.sep_positions[l:r]
+    
     ground_truth = all_bundle.ground_truth[l:r]
     passage_length = all_bundle.passage_length[l:r]
     pairs_num = all_bundle.pairs_num[l:r]
 
-    l_pairs = sum([x for x in all_bundle.pairs_num[:l]])
-    r_pairs = sum([x for x in all_bundle.pairs_num[:r]])
-    pairs_list = all_bundle.pairs_list[l_pairs, r_pairs]
+    l_pairs = sum(all_bundle.pairs_num[:l])
+    r_pairs = sum(all_bundle.pairs_num[:r])
+    pairs_list = all_bundle.pairs_list[l_pairs: r_pairs]
+
+    sep_positions = all_bundle.sep_positions[l_pairs:r_pairs]
+    
     for i in range(l_pairs,r_pairs):
-        length = len(all_bundle.ids[i])
+        length = len(all_bundle.input_ids[i])
         input_ids[i - l_pairs, :length] = torch.tensor(all_bundle.input_ids[i], dtype = torch.long)
         token_type_ids[i - l_pairs, :length] = torch.tensor(all_bundle.token_type_ids[i], dtype = torch.long)
         masked_ids[i - l_pairs, :length] = 1
